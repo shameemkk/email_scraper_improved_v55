@@ -1,12 +1,20 @@
 import 'dotenv/config';
+import cluster from 'cluster';
+import os from 'os';
 import express from 'express';
 import cors from 'cors';
 import { chromium } from 'playwright'; // Import Playwright directly
 import * as cheerio from 'cheerio'; // Import Cheerio
 import axios from 'axios'; // Import Axios for light HTTP requests
 
-const app = express();
 const PORT = process.env.PORT || 3000;
+// For handling 10k+ concurrent requests, use more workers than CPU cores
+// Each worker can handle many concurrent requests (Node.js is event-driven)
+// Default: 2x CPU cores, or set NUM_WORKERS env var to override
+const NUM_WORKERS = parseInt(process.env.NUM_WORKERS, 10) || Math.max(8, (os.cpus().length || 4) * 2);
+
+// Create Express app
+const app = express();
 
 // Configuration
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
@@ -984,8 +992,13 @@ app.get('/', (req, res) => {
       'Extract Facebook URLs',
       'Crawl multiple pages within same domain',
       'Handle JavaScript-rendered content',
-      'Cheerio-first approach with Playwright fallback'
-    ]
+      'Cheerio-first approach with Playwright fallback',
+      'Clustered architecture for high concurrency (10k+ requests)'
+    ],
+    clustering: {
+      workers: NUM_WORKERS,
+      note: 'Running in clustered mode for optimal performance'
+    }
   });
 });
 
@@ -993,28 +1006,84 @@ app.get('/', (req, res) => {
 async function startServer() {
   try {
     app.listen(PORT, () => {
-      console.log(`Email extraction API running on port ${PORT}`);
-      console.log(`Visit http://localhost:${PORT} for API documentation`);
+      console.log(`[Worker ${process.pid}] Email extraction API running on port ${PORT}`);
+      console.log(`[Worker ${process.pid}] Visit http://localhost:${PORT} for API documentation`);
     });
     
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error(`[Worker ${process.pid}] Failed to start server:`, error);
     await closeSharedBrowser();
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
-  await closeSharedBrowser();
-  process.exit(0);
-});
+// =========================================================================
+// CLUSTERING SETUP
+// =========================================================================
 
-process.on('SIGTERM', async () => {
-  console.log('Shutting down gracefully...');
-  await closeSharedBrowser();
-  process.exit(0);
-});
-
-startServer();
+if (cluster.isPrimary) {
+  // Master process - spawn workers
+  console.log(`[Master ${process.pid}] Starting ${NUM_WORKERS} workers...`);
+  
+  // Spawn workers
+  for (let i = 0; i < NUM_WORKERS; i++) {
+    const worker = cluster.fork();
+    console.log(`[Master] Spawned worker ${worker.process.pid}`);
+  }
+  
+  // Handle worker exit - restart if crashed
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`[Master] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`);
+    const newWorker = cluster.fork();
+    console.log(`[Master] Spawned new worker ${newWorker.process.pid}`);
+  });
+  
+  // Handle worker online
+  cluster.on('online', (worker) => {
+    console.log(`[Master] Worker ${worker.process.pid} is online`);
+  });
+  
+  // Graceful shutdown for master
+  const shutdown = async () => {
+    console.log('[Master] Shutting down gracefully...');
+    console.log('[Master] Closing all workers...');
+    
+    // Disconnect all workers
+    for (const id in cluster.workers) {
+      const worker = cluster.workers[id];
+      if (worker) {
+        worker.disconnect();
+      }
+    }
+    
+    // Wait a bit for workers to finish
+    setTimeout(() => {
+      console.log('[Master] Force exiting...');
+      process.exit(0);
+    }, 5000);
+  };
+  
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  
+} else {
+  // Worker process - start the server
+  startServer();
+  
+  // Graceful shutdown for workers
+  const shutdown = async () => {
+    console.log(`[Worker ${process.pid}] Shutting down gracefully...`);
+    await closeSharedBrowser();
+    process.exit(0);
+  };
+  
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  
+  // Handle disconnect from master
+  process.on('disconnect', async () => {
+    console.log(`[Worker ${process.pid}] Disconnected from master, closing browser...`);
+    await closeSharedBrowser();
+    process.exit(0);
+  });
+}
