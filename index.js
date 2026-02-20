@@ -3,9 +3,7 @@ import cluster from 'cluster';
 import os from 'os';
 import express from 'express';
 import cors from 'cors';
-import { chromium } from 'playwright'; // Import Playwright directly
-import * as cheerio from 'cheerio'; // Import Cheerio
-import axios from 'axios'; // Import Axios for light HTTP requests
+import { chromium } from 'playwright';
 
 const PORT = process.env.PORT || 3000;
 // For handling 10k+ concurrent requests, use more workers than CPU cores
@@ -35,9 +33,6 @@ const SCRAPE_DELAY_MAX_MS = Math.max(
   SCRAPE_DELAY_MIN_MS,
   Number.isFinite(rawScrapeDelayMax) ? rawScrapeDelayMax : Math.max(SCRAPE_DELAY_MIN_MS, 100)
 );
-const REQUEST_TIMEOUT_MS = 5000; // 5 seconds for initial HTTP request
-const HTTP_MAX_RETRIES = Math.max(0, parseInt(process.env.HTTP_MAX_RETRIES, 10) || 2);
-const RETRY_BACKOFF_BASE_MS = Math.max(100, parseInt(process.env.RETRY_BACKOFF_BASE_MS, 10) || 500);
 const MAX_LINKS_PER_PAGE = Math.max(1, parseInt(process.env.MAX_LINKS_PER_PAGE, 10) || 50);
 const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISITED_URLS, 10) || 200);
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
@@ -102,37 +97,6 @@ function getNextProxyUrl() {
   const proxyUrl = proxyPool[proxyCursor % proxyPool.length];
   proxyCursor = (proxyCursor + 1) % proxyPool.length;
   return proxyUrl;
-}
-
-function buildAxiosProxyConfig(proxyUrl) {
-  if (!proxyUrl) {
-    return undefined;
-  }
-
-  try {
-    const parsed = new URL(proxyUrl);
-    const auth = parsed.username
-      ? {
-          username: decodeURIComponent(parsed.username),
-          password: decodeURIComponent(parsed.password || '')
-        }
-      : undefined;
-
-    const protocol = parsed.protocol.replace(':', '');
-    const port = parsed.port
-      ? parseInt(parsed.port, 10)
-      : protocol === 'https' ? 443 : 80;
-
-    return {
-      protocol,
-      host: parsed.hostname,
-      port,
-      auth
-    };
-  } catch (error) {
-    console.warn(`[Proxy] Failed to parse proxy URL "${proxyUrl}":`, error?.message || error);
-    return undefined;
-  }
 }
 
 const COMMON_PAGE_PATHS = [
@@ -523,14 +487,14 @@ const playwrightContextSemaphore = new AsyncSemaphore(PLAYWRIGHT_MAX_CONTEXTS);
 
 
 // =========================================================================
-// NEW: Playwright/Cheerio Core Functions
+// Playwright-Only Core Scraping
 // =========================================================================
 
 /**
- * Scrapes a single URL using the Cheerio-first, Playwright-fallback strategy.
+ * Scrapes a single URL using Playwright browser rendering.
  * @param {string} url - The URL to scrape.
- * @param {number} depth - The current crawl depth (for recursive calls).
- * @param {Set<string>} visitedUrls - Set of URLs already visited in this job.
+ * @param {number} depth - The current crawl depth.
+ * @param {Set<string>} visitedUrls - URLs already visited in this job.
  * @returns {Promise<{emails: string[], facebookUrls: string[], newUrls: string[]}>}
  */
 async function scrapeUrl(url, depth, visitedUrls) {
@@ -545,7 +509,6 @@ async function scrapeUrl(url, depth, visitedUrls) {
   }
   visitedUrls.add(url);
 
-  // Apply minimal delay only if configured (default is 0 for speed)
   if (SCRAPE_DELAY_MAX_MS > 0) {
     const scrapeDelay = SCRAPE_DELAY_MIN_MS + Math.random() * (SCRAPE_DELAY_MAX_MS - SCRAPE_DELAY_MIN_MS);
     if (scrapeDelay > 0) {
@@ -553,305 +516,162 @@ async function scrapeUrl(url, depth, visitedUrls) {
     }
   }
 
-  let htmlContent = '';
-  let isJsRendered = false;
-  let activeIdentity = getNextIdentity();
-  let activeProxy = getNextProxyUrl();
+  const activeIdentity = getNextIdentity();
+  const activeProxy = getNextProxyUrl();
 
-  // --- 1. Cheerio-First (Light/Fast HTTP Request) ---
+  let browser;
+  let context;
+  let page;
+  let semaphoreAcquired = false;
+
   try {
-    let response = null;
-    let fetchError = null;
+    browser = await getSharedBrowser();
+    await playwrightContextSemaphore.acquire();
+    semaphoreAcquired = true;
 
-    for (let attempt = 0; attempt <= HTTP_MAX_RETRIES; attempt++) {
-      const attemptIdentity = attempt === 0 ? activeIdentity : getNextIdentity();
-      const attemptProxy = attempt === 0 ? activeProxy : (getNextProxyUrl() || activeProxy);
-      const axiosProxyConfig = buildAxiosProxyConfig(attemptProxy);
+    const contextOptions = {
+      userAgent: activeIdentity.userAgent,
+      locale: activeIdentity.locale,
+      viewport: activeIdentity.viewport,
+      ...(activeProxy ? { proxy: { server: activeProxy } } : {})
+    };
 
+    context = await browser.newContext(contextOptions);
+    await context.setExtraHTTPHeaders({
+      'Accept-Language': activeIdentity.acceptLanguage,
+      ...(activeIdentity.referer ? { Referer: activeIdentity.referer } : {})
+    });
+    await context.route('**/*', async (route) => {
       try {
-        response = await axios.get(url, {
-          timeout: REQUEST_TIMEOUT_MS,
-          validateStatus: (status) => status >= 200 && status < 400, 
-          headers: {
-            'User-Agent': attemptIdentity.userAgent,
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': attemptIdentity.acceptLanguage,
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-            ...(attemptIdentity.referer ? { Referer: attemptIdentity.referer } : {})
-          },
-          maxRedirects: 5,
-          decompress: true, // Automatically decompress gzipped responses
-          maxContentLength: 512 * 1024,
-          maxBodyLength: 512 * 1024,
-          responseType: 'text',
-          transformResponse: [(data) => data],
-          ...(axiosProxyConfig ? { proxy: axiosProxyConfig } : {})
-        });
-
-        activeIdentity = attemptIdentity;
-        activeProxy = attemptProxy;
-        fetchError = null;
-        break;
-      } catch (error) {
-        fetchError = error;
-        const status = error?.response?.status;
-        const shouldRetry = status === 403 || status === 429 || error?.code === 'ECONNABORTED';
-
-        if (!shouldRetry || attempt === HTTP_MAX_RETRIES) {
-          if (shouldRetry) {
-            isJsRendered = true;
-          }
-          break;
+        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())) {
+          await route.abort();
+          return;
         }
-
-        const backoffMs = RETRY_BACKOFF_BASE_MS * Math.pow(2, attempt);
-        await delay(backoffMs);
+      } catch {
+        // continue normally on error
       }
-    }
+      await route.continue();
+    });
 
-    if (!response) {
-      if (fetchError && !isJsRendered) {
-        throw fetchError;
-      }
-      isJsRendered = true;
-    } else {
-      htmlContent = typeof response.data === 'string' ? response.data : '';
-    }
+    page = await context.newPage();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForTimeout(300);
 
-    if (!htmlContent) {
-      isJsRendered = true;
-    } else {
-      // Collect Facebook links from the static HTML pass
-      const facebookLinks = extractFacebookUrls(htmlContent);
-      if (facebookLinks.length > 0) {
-        result.facebookUrls.push(...facebookLinks);
-      }
-
-      // Attempt extraction with Cheerio
-      const emails = extractEmails(htmlContent);
-
-      if (emails.length > 0) {
-        result.emails.push(...emails);
-        console.log(`[Cheerio] Found ${emails.length} emails. Job successful.`);
-        
-        // If emails found, gather next targets from navigation plus common pages
-        const $ = cheerio.load(htmlContent);
-        const linkCollector = createSameDomainLinkCollector(url);
-        linkCollector.addCommonPages();
-
-        const navLinks = $('nav a, header a, .navbar a, .nav a, .navigation a, .menu a, .main-menu a, .primary-menu a, .top-menu a, [role="navigation"] a, .site-nav a, .main-nav a')
-          .map((i, el) => {
-            const href = $(el).attr('href');
-            if (!href || href.startsWith('#') || href.startsWith('javascript:')) return null;
-            try {
-              return new URL(href, url).href;
-            } catch {
-              return null;
-            }
-          })
-          .get()
-          .filter(Boolean);
-
-        for (const link of navLinks) {
-          linkCollector.addCandidateLink(link);
+    const evaluationResult = await page.evaluate((candidateLimit) => {
+      const toAbsolute = (href) => {
+        try {
+          return new URL(href, window.location.href).href;
+        } catch {
+          return null;
         }
-
-        const collectedLinks = linkCollector.getLinks();
-        if (collectedLinks.length > 0) {
-          result.newUrls.push(...collectedLinks);
-        }
-
-        return result; // Early exit if successful with Cheerio
-      }
-    }
-
-  } catch (error) {
-    const message = error && error.message ? error.message : 'Unknown error';
-    if (/maxcontentlength|maxbodylength/i.test(message)) {
-      console.log(`[Cheerio Fallback] Response exceeded static fetch limit for ${url}. Escalating to Playwright.`);
-    } else {
-      console.log(`[Cheerio Fallback] HTTP request or initial Cheerio attempt failed for ${url}: ${message}`);
-    }
-    isJsRendered = true; // Assume JS rendering or a temporary error
-  }
-
-
-  // --- 2. Playwright-Fallback (Full Browser Rendering) ---
-  if (isJsRendered || result.emails.length === 0) {
-    console.log(`[Playwright] Falling back to browser rendering for ${url}...`);
-    let browser;
-    let context;
-    let page;
-    let semaphoreAcquired = false;
-    try {
-      // Reuse a shared browser instance for faster startup
-      browser = await getSharedBrowser();
-      await playwrightContextSemaphore.acquire();
-      semaphoreAcquired = true;
-      // Create explicit context and page
-      const contextOptions = {
-        userAgent: activeIdentity.userAgent,
-        locale: activeIdentity.locale,
-        viewport: activeIdentity.viewport,
-        ...(activeProxy ? { proxy: { server: activeProxy } } : {})
       };
 
-      context = await browser.newContext(contextOptions);
-      await context.setExtraHTTPHeaders({
-        'Accept-Language': activeIdentity.acceptLanguage,
-        ...(activeIdentity.referer ? { Referer: activeIdentity.referer } : {})
+      const normalizeEmail = (value) => value.trim();
+      const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+      const emailSet = new Set();
+      const facebookSet = new Set();
+      const candidateSet = new Set();
+
+      document.querySelectorAll('a[href^="mailto:"]').forEach((anchor) => {
+        const href = anchor.getAttribute('href');
+        if (!href) return;
+        const email = href.slice('mailto:'.length);
+        if (email) {
+          emailSet.add(normalizeEmail(email));
+        }
       });
-      await context.route('**/*', async (route) => {
-        try {
-          if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())) {
-            await route.abort();
-            return;
+
+      const anchors = Array.from(document.querySelectorAll('a[href]'));
+      anchors.forEach((anchor) => {
+        const rawHref = anchor.getAttribute('href') || '';
+        if (!rawHref || rawHref.startsWith('#')) return;
+        if (rawHref.toLowerCase().startsWith('javascript:')) return;
+
+        const absoluteHref = toAbsolute(rawHref);
+        if (absoluteHref) {
+          if (!candidateSet.has(absoluteHref) && candidateSet.size < candidateLimit) {
+            candidateSet.add(absoluteHref);
           }
-        } catch {
-          // If anything goes wrong while checking the request, continue normally.
+          const lowerHref = absoluteHref.toLowerCase();
+          if (lowerHref.includes('facebook.com') || lowerHref.includes('fb.com/')) {
+            facebookSet.add(absoluteHref);
+          }
         }
-        await route.continue();
       });
-      page = await context.newPage();
-      
-      // Use faster load strategy - 'domcontentloaded' is faster than 'networkidle'
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }); 
-      
-      // Minimal wait for dynamic content (reduced from 1000ms)
-      await page.waitForTimeout(300); 
 
-      const evaluationResult = await page.evaluate((candidateLimit) => {
-        const toAbsolute = (href) => {
-          try {
-            return new URL(href, window.location.href).href;
-          } catch {
-            return null;
-          }
-        };
-
-        const normalizeEmail = (value) => value.trim();
-        const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-        const emailSet = new Set();
-        const facebookSet = new Set();
-        const candidateSet = new Set();
-
-        document.querySelectorAll('a[href^="mailto:"]').forEach((anchor) => {
-          const href = anchor.getAttribute('href');
-          if (!href) return;
-          const email = href.slice('mailto:'.length);
-          if (email) {
-            emailSet.add(normalizeEmail(email));
-          }
-        });
-
-        const anchors = Array.from(document.querySelectorAll('a[href]'));
-        anchors.forEach((anchor) => {
-          const rawHref = anchor.getAttribute('href') || '';
-          if (!rawHref || rawHref.startsWith('#')) {
-            return;
-          }
-          const lowerRaw = rawHref.toLowerCase();
-          if (lowerRaw.startsWith('javascript:')) {
-            return;
-          }
-          const absoluteHref = toAbsolute(rawHref);
-          if (absoluteHref) {
-            if (!candidateSet.has(absoluteHref) && candidateSet.size < candidateLimit) {
-              candidateSet.add(absoluteHref);
-            }
-            const lowerHref = absoluteHref.toLowerCase();
-            if (lowerHref.includes('facebook.com') || lowerHref.includes('fb.com/')) {
-              facebookSet.add(absoluteHref);
-            }
-          }
-        });
-
-        const bodyText = document.body ? document.body.innerText || '' : '';
-        if (bodyText) {
-          const inlineEmails = bodyText.match(emailRegex);
-          if (inlineEmails) {
-            inlineEmails.forEach((email) => emailSet.add(normalizeEmail(email)));
-          }
-          const facebookMatches = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
-          if (facebookMatches) {
-            facebookMatches.forEach((href) => {
-              const absolute = toAbsolute(href) || href;
-              facebookSet.add(absolute);
-            });
-          }
+      const bodyText = document.body ? document.body.innerText || '' : '';
+      if (bodyText) {
+        const inlineEmails = bodyText.match(emailRegex);
+        if (inlineEmails) {
+          inlineEmails.forEach((email) => emailSet.add(normalizeEmail(email)));
         }
-
-        const uniqueCandidates = Array.from(candidateSet);
-        return {
-          emails: Array.from(emailSet),
-          facebookUrls: Array.from(facebookSet),
-          candidateLinks: uniqueCandidates.slice(0, candidateLimit)
-        };
-      }, MAX_LINKS_PER_PAGE);
-
-      const pageEmails = Array.isArray(evaluationResult?.emails) ? evaluationResult.emails : [];
-      const pageFacebookUrls = Array.isArray(evaluationResult?.facebookUrls) ? evaluationResult.facebookUrls : [];
-      const candidateLinks = Array.isArray(evaluationResult?.candidateLinks) ? evaluationResult.candidateLinks : [];
-
-      if (pageEmails.length > 0) {
-        result.emails.push(...pageEmails);
-      }
-      if (pageFacebookUrls.length > 0) {
-        result.facebookUrls.push(...pageFacebookUrls);
-      }
-
-      if (depth < MAX_DEPTH && result.emails.length === 0 && candidateLinks.length > 0) {
-        const linkCollector = createSameDomainLinkCollector(url);
-        linkCollector.addCommonPages();
-        for (const link of candidateLinks) {
-          linkCollector.addCandidateLink(link);
-        }
-        const collectedLinks = linkCollector.getLinks();
-        if (collectedLinks.length > 0) {
-          result.newUrls.push(...collectedLinks);
+        const facebookMatches = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
+        if (facebookMatches) {
+          facebookMatches.forEach((href) => {
+            const absolute = toAbsolute(href) || href;
+            facebookSet.add(absolute);
+          });
         }
       }
-      
-      console.log(`[Playwright] Extracted ${pageEmails.length} emails and ${candidateLinks.length} candidate link(s).`);
 
-    } catch (error) {
-      console.error(`[Playwright Error] Failed to process ${url}:`, error);
-      if (!browser || !browser.isConnected()) {
-        await resetSharedBrowser();
+      const fullHtml = document.documentElement ? document.documentElement.outerHTML : '';
+
+      return {
+        emails: Array.from(emailSet),
+        facebookUrls: Array.from(facebookSet),
+        candidateLinks: Array.from(candidateSet).slice(0, candidateLimit),
+        html: fullHtml
+      };
+    }, MAX_LINKS_PER_PAGE);
+
+    const pageEmails = Array.isArray(evaluationResult?.emails) ? evaluationResult.emails : [];
+    const pageFacebookUrls = Array.isArray(evaluationResult?.facebookUrls) ? evaluationResult.facebookUrls : [];
+    const candidateLinks = Array.isArray(evaluationResult?.candidateLinks) ? evaluationResult.candidateLinks : [];
+    const renderedHtml = evaluationResult?.html || '';
+
+    const serverEmails = extractEmails(renderedHtml);
+    const serverFacebookUrls = extractFacebookUrls(renderedHtml);
+
+    const mergedEmails = [...new Set([...pageEmails, ...serverEmails])];
+    const mergedFacebook = [...new Set([...pageFacebookUrls, ...serverFacebookUrls])];
+
+    if (mergedEmails.length > 0) {
+      result.emails.push(...mergedEmails);
+    }
+    if (mergedFacebook.length > 0) {
+      result.facebookUrls.push(...mergedFacebook);
+    }
+
+    if (depth < MAX_DEPTH && result.emails.length === 0 && candidateLinks.length > 0) {
+      const linkCollector = createSameDomainLinkCollector(url);
+      linkCollector.addCommonPages();
+      for (const link of candidateLinks) {
+        linkCollector.addCandidateLink(link);
       }
-      // Re-throw to let the caller handle the error
-      throw error;
-    } finally {
-      if (page) {
-        try {
-          await page.close();
-        } catch (closeErr) {
-          console.error(`[Playwright] Failed to close page for ${url}: ${closeErr.message}`);
-        }
-      }
-      if (context) {
-        try {
-          await context.close();
-        } catch (closeErr) {
-          console.error(`[Playwright] Failed to close context for ${url}: ${closeErr.message}`);
-        }
-      }
-      if (semaphoreAcquired) {
-        playwrightContextSemaphore.release();
+      const collectedLinks = linkCollector.getLinks();
+      if (collectedLinks.length > 0) {
+        result.newUrls.push(...collectedLinks);
       }
     }
-  }
 
-  // --- 3. Final Check & Fallback Extraction (if no emails found) ---
-  if (result.emails.length === 0 && htmlContent) {
-    // Only extract Facebook URLs if no emails were found on the primary page
-    result.facebookUrls.push(...extractFacebookUrls(htmlContent));
+    console.log(`[Playwright] ${url} → ${mergedEmails.length} emails, ${candidateLinks.length} links`);
+
+  } catch (error) {
+    console.error(`[Playwright Error] Failed to process ${url}:`, error);
+    if (!browser || !browser.isConnected()) {
+      await resetSharedBrowser();
+    }
+    throw error;
+  } finally {
+    if (page) {
+      try { await page.close(); } catch { /* ignore */ }
+    }
+    if (context) {
+      try { await context.close(); } catch { /* ignore */ }
+    }
+    if (semaphoreAcquired) {
+      playwrightContextSemaphore.release();
+    }
   }
 
   return result;
@@ -991,8 +811,8 @@ app.get('/', (req, res) => {
       'Extract email addresses',
       'Extract Facebook URLs',
       'Crawl multiple pages within same domain',
-      'Handle JavaScript-rendered content',
-      'Cheerio-first approach with Playwright fallback',
+      'Full JavaScript rendering via Playwright',
+      'Playwright-only architecture - no static fallbacks',
       'Clustered architecture for high concurrency (10k+ requests)'
     ],
     clustering: {
