@@ -534,10 +534,15 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       const fbRaw = [];
       const candidateSet = new Set();
 
-      document.querySelectorAll('a[href^="mailto:"]').forEach((a) => {
-        const href = a.getAttribute('href');
-        if (href) {
-          const email = href.slice(7).split('?')[0].trim();
+      const decodeEmail = (raw) => {
+        try { return decodeURIComponent(raw).toLowerCase().trim(); } catch { return raw.toLowerCase().trim(); }
+      };
+
+      document.querySelectorAll('a[href]').forEach((a) => {
+        let href = a.getAttribute('href') || '';
+        try { href = decodeURIComponent(href); } catch {}
+        if (href.toLowerCase().startsWith('mailto:')) {
+          const email = decodeEmail(href.slice(7).split('?')[0]);
           if (email) emailSet.add(email);
         }
       });
@@ -555,7 +560,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       const bodyText = document.body ? document.body.innerText || '' : '';
       if (bodyText) {
         const found = bodyText.match(emailRegex);
-        if (found) found.forEach((e) => emailSet.add(e.trim()));
+        if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
 
         const fbText = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
         if (fbText) fbRaw.push(...fbText);
@@ -564,7 +569,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       document.querySelectorAll('script').forEach((s) => {
         const c = s.textContent;
         if (!c || !/facebook\.com|fb\.com/i.test(c)) return;
-        const m = c.match(/https?(?:[:\\/]{1,4}|%3A%2F%2F)(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>\\)]{1,500}/gi);
+        const m = c.match(/https?(?:[:\\/]{1,5}|%3A%2F%2F)(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>\\)]{1,500}/gi);
         if (m) fbRaw.push(...m);
       });
 
@@ -584,7 +589,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     if (pageEmails.length > 0) result.emails.push(...pageEmails);
     if (normalizedFacebook.length > 0) result.facebookUrls.push(...normalizedFacebook);
 
-    if (depth < MAX_DEPTH && result.emails.length === 0 && candidateLinks.length > 0) {
+    if (depth < MAX_DEPTH && candidateLinks.length > 0) {
       const linkCollector = createSameDomainLinkCollector(url);
       linkCollector.addCommonPages();
       for (const link of candidateLinks) linkCollector.addCandidateLink(link);
@@ -647,7 +652,7 @@ async function scrapeWebsite(url) {
     primaryResult.emails.forEach((e) => uniqueEmails.add(e));
     primaryResult.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
 
-    if (MAX_DEPTH > 1 && uniqueEmails.size === 0) {
+    if (MAX_DEPTH > 1) {
       const baseOrigin = new URL(url).origin;
       const subpageLimit = Math.min(MAX_SUBPAGE_CRAWLS, MAX_LINKS_PER_PAGE);
       const candidateLinks = (primaryResult.newUrls || [])
