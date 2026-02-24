@@ -6,22 +6,22 @@ import cors from 'cors';
 import { chromium } from 'playwright';
 
 const PORT = process.env.PORT || 3000;
-const NUM_WORKERS = parseInt(process.env.NUM_WORKERS, 10) || (os.cpus().length || 4);
+const NUM_WORKERS = parseInt(process.env.NUM_WORKERS, 10) || (os.cpus().length || 10);
 
 // Create Express app
 const app = express();
 
 // Configuration
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
-const parsedSubpageConcurrency = parseInt(process.env.SUBPAGE_CONCURRENCY, 10);
+const parsedSubpageConcurrency = parseInt(process.env.SUBPAGE_CONCURRENCY, 6);
 const SUBPAGE_CONCURRENCY = Math.max(
   1,
-  Number.isFinite(parsedSubpageConcurrency) ? parsedSubpageConcurrency : 4
+  Number.isFinite(parsedSubpageConcurrency) ? parsedSubpageConcurrency : 10
 ); // Max secondary links in parallel
-const parsedPlaywrightContexts = parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10);
+const parsedPlaywrightContexts = parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 6);
 const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
   1,
-  Number.isFinite(parsedPlaywrightContexts) ? parsedPlaywrightContexts : 6
+  Number.isFinite(parsedPlaywrightContexts) ? parsedPlaywrightContexts : 10
 );
 const rawScrapeDelayMin = parseInt(process.env.SCRAPE_DELAY_MIN_MS, 10);
 const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 10);
@@ -384,6 +384,23 @@ function generateCommonPageVariants(pagePath) {
   return variants;
 }
 
+// File extensions to exclude from crawling (PDFs, images, documents, etc.)
+const EXCLUDED_FILE_EXTENSIONS = new Set([
+  'pdf', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'ico', 'bmp', 'tiff', 'tif',
+  'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'zip', 'rar', 'tar', 'gz', '7z',
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'webm', 'flv', 'wmv', 'm4a', 'ogg'
+]);
+
+function isNonHtmlResource(url) {
+  try {
+    const pathname = new URL(url).pathname.toLowerCase();
+    const ext = pathname.split('.').pop()?.split(/[?#]/)[0] || '';
+    return ext && EXCLUDED_FILE_EXTENSIONS.has(ext);
+  } catch {
+    return false;
+  }
+}
+
 function createSameDomainLinkCollector(baseUrlHref) {
   const baseUrl = new URL(baseUrlHref);
   const normalizedCurrentUrl = cleanUrl(baseUrl.href);
@@ -393,6 +410,9 @@ function createSameDomainLinkCollector(baseUrlHref) {
 
   const addCandidateLink = (candidate) => {
     if (!candidate || !canAddMore()) {
+      return;
+    }
+    if (isNonHtmlResource(candidate)) {
       return;
     }
     try {
@@ -522,6 +542,8 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
   let page;
   try {
     page = await context.newPage();
+    // Cancel any downloads (e.g. when server sends Content-Disposition: attachment)
+    page.on('download', (download) => download.cancel().catch(() => {}));
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
     const evalResult = await page.evaluate((candidateLimit) => {
@@ -640,9 +662,36 @@ async function scrapeWebsite(url) {
 
     await context.route('**/*', async (route) => {
       try {
-        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())) {
+        const req = route.request();
+        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
           await route.abort();
           return;
+        }
+        // Block URLs that trigger downloads (PDF, images, documents, etc.)
+        if (isNonHtmlResource(req.url())) {
+          await route.abort();
+          return;
+        }
+        // For document requests: strip Content-Disposition: attachment so the page renders instead of downloading
+        if (req.resourceType() === 'document') {
+          try {
+            const response = await route.fetch();
+            const rawHeaders = response.headers();
+            const cd = rawHeaders['content-disposition'] || rawHeaders['Content-Disposition'] || '';
+            if (cd.toLowerCase().startsWith('attachment')) {
+              const headers = {};
+              for (const [k, v] of Object.entries(rawHeaders)) {
+                if (k.toLowerCase() !== 'content-disposition') headers[k] = v;
+              }
+              headers['content-disposition'] = 'inline';
+              await route.fulfill({
+                status: response.status(),
+                headers,
+                body: await response.body(),
+              });
+              return;
+            }
+          } catch { /* fall through to continue */ }
         }
       } catch { /* ignore */ }
       await route.continue();
@@ -718,6 +767,14 @@ app.post('/extract-emails', async (req, res) => {
       return res.status(400).json({ 
         error: 'Invalid URL format',
         message: 'Please provide a valid URL'
+      });
+    }
+
+    // Reject PDF, image, and other non-HTML resource URLs
+    if (isNonHtmlResource(url)) {
+      return res.status(400).json({ 
+        error: 'Unsupported URL type',
+        message: 'PDF, image, and document URLs are not supported. Please provide a webpage URL.'
       });
     }
 
