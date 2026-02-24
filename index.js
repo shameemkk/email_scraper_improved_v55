@@ -31,6 +31,7 @@ const SCRAPE_DELAY_MAX_MS = Math.max(
   Number.isFinite(rawScrapeDelayMax) ? rawScrapeDelayMax : SCRAPE_DELAY_MIN_MS
 );
 const MAX_LINKS_PER_PAGE = Math.max(1, parseInt(process.env.MAX_LINKS_PER_PAGE, 10) || 50);
+const PAGE_NAVIGATION_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PAGE_NAVIGATION_TIMEOUT_MS, 10) || 60000);
 const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISITED_URLS, 10) || 200);
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
 const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
@@ -544,9 +545,15 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     page = await context.newPage();
     // Cancel any downloads (e.g. when server sends Content-Disposition: attachment)
     page.on('download', (download) => download.cancel().catch(() => {}));
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_NAVIGATION_TIMEOUT_MS });
+    // Wait for the network to go quiet so JS-rendered content (including emails) has time to appear
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForFunction(
+      () => (document.body?.innerText?.length || 0) > 200,
+      { timeout: 10000 }
+    ).catch(() => {});
 
-    const evalResult = await page.evaluate((candidateLimit) => {
+    const runPageEvaluate = () => page.evaluate((candidateLimit) => {
       const toAbsolute = (href) => {
         try { return new URL(href, window.location.href).href; } catch { return null; }
       };
@@ -601,6 +608,15 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
         candidateLinks: Array.from(candidateSet).slice(0, candidateLimit),
       };
     }, MAX_LINKS_PER_PAGE);
+
+    let evalResult = await runPageEvaluate();
+
+    // If no emails found, the page might still be JS-rendering — wait and retry once
+    if ((!evalResult?.emails || evalResult.emails.length === 0)) {
+      await delay(3000);
+      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      evalResult = await runPageEvaluate();
+    }
 
     const pageEmails = evalResult?.emails || [];
     const fbRaw = evalResult?.fbRaw || [];
@@ -736,7 +752,7 @@ async function scrapeWebsite(url) {
   } catch (error) {
     const browser = sharedBrowserInstance;
     if (browser && !browser.isConnected()) await resetSharedBrowser();
-    console.error(`Scrape failed for ${url}:`, error);
+    // console.error(`Scrape failed for ${url}:`, error);
     throw error;
   } finally {
     if (context) try { await context.close(); } catch { /* ignore */ }
