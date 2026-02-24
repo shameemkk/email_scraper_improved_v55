@@ -6,10 +6,7 @@ import cors from 'cors';
 import { chromium } from 'playwright';
 
 const PORT = process.env.PORT || 3000;
-// For handling 10k+ concurrent requests, use more workers than CPU cores
-// Each worker can handle many concurrent requests (Node.js is event-driven)
-// Default: 2x CPU cores, or set NUM_WORKERS env var to override
-const NUM_WORKERS = parseInt(process.env.NUM_WORKERS, 10) || Math.max(8, (os.cpus().length || 4) * 2);
+const NUM_WORKERS = parseInt(process.env.NUM_WORKERS, 10) || (os.cpus().length || 4);
 
 // Create Express app
 const app = express();
@@ -31,12 +28,15 @@ const rawScrapeDelayMax = parseInt(process.env.SCRAPE_DELAY_MAX_MS, 10);
 const SCRAPE_DELAY_MIN_MS = Math.max(0, Number.isFinite(rawScrapeDelayMin) ? rawScrapeDelayMin : 0);
 const SCRAPE_DELAY_MAX_MS = Math.max(
   SCRAPE_DELAY_MIN_MS,
-  Number.isFinite(rawScrapeDelayMax) ? rawScrapeDelayMax : Math.max(SCRAPE_DELAY_MIN_MS, 100)
+  Number.isFinite(rawScrapeDelayMax) ? rawScrapeDelayMax : SCRAPE_DELAY_MIN_MS
 );
 const MAX_LINKS_PER_PAGE = Math.max(1, parseInt(process.env.MAX_LINKS_PER_PAGE, 10) || 50);
 const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISITED_URLS, 10) || 200);
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
-const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font', 'stylesheet']);
+const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
+  'image', 'media', 'font', 'stylesheet', 'texttrack',
+  'eventsource', 'websocket', 'manifest', 'ping',
+]);
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -114,6 +114,19 @@ const PLAYWRIGHT_LAUNCH_ARGS = [
   '--disable-gpu',
   '--no-zygote',
   '--no-sandbox',
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-default-apps',
+  '--disable-sync',
+  '--disable-translate',
+  '--hide-scrollbars',
+  '--mute-audio',
+  '--metrics-recording-only',
+  '--disable-renderer-backgrounding',
+  '--disable-component-update',
+  '--disable-breakpad',
+  '--disable-features=TranslateUI',
+  '--disable-ipc-flooding-protection',
 ];
 
 let sharedBrowserInstance = null;
@@ -491,187 +504,100 @@ const playwrightContextSemaphore = new AsyncSemaphore(PLAYWRIGHT_MAX_CONTEXTS);
 // =========================================================================
 
 /**
- * Scrapes a single URL using Playwright browser rendering.
- * @param {string} url - The URL to scrape.
- * @param {number} depth - The current crawl depth.
- * @param {Set<string>} visitedUrls - URLs already visited in this job.
- * @returns {Promise<{emails: string[], facebookUrls: string[], newUrls: string[]}>}
+ * Scrapes a single URL using an already-open Playwright context.
+ * Opens a page, extracts data in-browser, closes the page.
+ * No full HTML is transferred back -- all extraction runs in the browser.
  */
-async function scrapeUrl(url, depth, visitedUrls) {
-  const result = {
-    emails: [],
-    facebookUrls: [],
-    newUrls: [],
-  };
+async function scrapeUrl(url, depth, visitedUrls, context) {
+  const result = { emails: [], facebookUrls: [], newUrls: [] };
 
-  if (visitedUrls.has(url)) {
-    return result;
-  }
+  if (visitedUrls.has(url)) return result;
   visitedUrls.add(url);
 
   if (SCRAPE_DELAY_MAX_MS > 0) {
-    const scrapeDelay = SCRAPE_DELAY_MIN_MS + Math.random() * (SCRAPE_DELAY_MAX_MS - SCRAPE_DELAY_MIN_MS);
-    if (scrapeDelay > 0) {
-      await delay(scrapeDelay);
-    }
+    const ms = SCRAPE_DELAY_MIN_MS + Math.random() * (SCRAPE_DELAY_MAX_MS - SCRAPE_DELAY_MIN_MS);
+    if (ms > 0) await delay(ms);
   }
 
-  const activeIdentity = getNextIdentity();
-  const activeProxy = getNextProxyUrl();
-
-  let browser;
-  let context;
   let page;
-  let semaphoreAcquired = false;
-
   try {
-    browser = await getSharedBrowser();
-    await playwrightContextSemaphore.acquire();
-    semaphoreAcquired = true;
-
-    const contextOptions = {
-      userAgent: activeIdentity.userAgent,
-      locale: activeIdentity.locale,
-      viewport: activeIdentity.viewport,
-      ...(activeProxy ? { proxy: { server: activeProxy } } : {})
-    };
-
-    context = await browser.newContext(contextOptions);
-    await context.setExtraHTTPHeaders({
-      'Accept-Language': activeIdentity.acceptLanguage,
-      ...(activeIdentity.referer ? { Referer: activeIdentity.referer } : {})
-    });
-    await context.route('**/*', async (route) => {
-      try {
-        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())) {
-          await route.abort();
-          return;
-        }
-      } catch {
-        // continue normally on error
-      }
-      await route.continue();
-    });
-
     page = await context.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await page.waitForTimeout(300);
 
-    const evaluationResult = await page.evaluate((candidateLimit) => {
+    const evalResult = await page.evaluate((candidateLimit) => {
       const toAbsolute = (href) => {
-        try {
-          return new URL(href, window.location.href).href;
-        } catch {
-          return null;
-        }
+        try { return new URL(href, window.location.href).href; } catch { return null; }
       };
 
-      const normalizeEmail = (value) => value.trim();
       const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
       const emailSet = new Set();
-      const facebookSet = new Set();
+      const fbRaw = [];
       const candidateSet = new Set();
 
-      document.querySelectorAll('a[href^="mailto:"]').forEach((anchor) => {
-        const href = anchor.getAttribute('href');
-        if (!href) return;
-        const email = href.slice('mailto:'.length);
-        if (email) {
-          emailSet.add(normalizeEmail(email));
+      document.querySelectorAll('a[href^="mailto:"]').forEach((a) => {
+        const href = a.getAttribute('href');
+        if (href) {
+          const email = href.slice(7).split('?')[0].trim();
+          if (email) emailSet.add(email);
         }
       });
 
-      const anchors = Array.from(document.querySelectorAll('a[href]'));
-      anchors.forEach((anchor) => {
-        const rawHref = anchor.getAttribute('href') || '';
-        if (!rawHref || rawHref.startsWith('#')) return;
-        if (rawHref.toLowerCase().startsWith('javascript:')) return;
-
-        const absoluteHref = toAbsolute(rawHref);
-        if (absoluteHref) {
-          if (!candidateSet.has(absoluteHref) && candidateSet.size < candidateLimit) {
-            candidateSet.add(absoluteHref);
-          }
-          const lowerHref = absoluteHref.toLowerCase();
-          if (lowerHref.includes('facebook.com') || lowerHref.includes('fb.com/')) {
-            facebookSet.add(absoluteHref);
-          }
-        }
+      document.querySelectorAll('a[href]').forEach((a) => {
+        const raw = a.getAttribute('href') || '';
+        if (!raw || raw.startsWith('#') || raw.toLowerCase().startsWith('javascript:')) return;
+        const abs = toAbsolute(raw);
+        if (!abs) return;
+        if (candidateSet.size < candidateLimit) candidateSet.add(abs);
+        const lower = abs.toLowerCase();
+        if (lower.includes('facebook.com') || lower.includes('fb.com/')) fbRaw.push(abs);
       });
 
       const bodyText = document.body ? document.body.innerText || '' : '';
       if (bodyText) {
-        const inlineEmails = bodyText.match(emailRegex);
-        if (inlineEmails) {
-          inlineEmails.forEach((email) => emailSet.add(normalizeEmail(email)));
-        }
-        const facebookMatches = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
-        if (facebookMatches) {
-          facebookMatches.forEach((href) => {
-            const absolute = toAbsolute(href) || href;
-            facebookSet.add(absolute);
-          });
-        }
+        const found = bodyText.match(emailRegex);
+        if (found) found.forEach((e) => emailSet.add(e.trim()));
+
+        const fbText = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
+        if (fbText) fbRaw.push(...fbText);
       }
 
-      const fullHtml = document.documentElement ? document.documentElement.outerHTML : '';
+      document.querySelectorAll('script').forEach((s) => {
+        const c = s.textContent;
+        if (!c || !/facebook\.com|fb\.com/i.test(c)) return;
+        const m = c.match(/https?(?:[:\\/]{1,4}|%3A%2F%2F)(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>\\)]{1,500}/gi);
+        if (m) fbRaw.push(...m);
+      });
 
       return {
         emails: Array.from(emailSet),
-        facebookUrls: Array.from(facebookSet),
+        fbRaw,
         candidateLinks: Array.from(candidateSet).slice(0, candidateLimit),
-        html: fullHtml
       };
     }, MAX_LINKS_PER_PAGE);
 
-    const pageEmails = Array.isArray(evaluationResult?.emails) ? evaluationResult.emails : [];
-    const pageFacebookUrls = Array.isArray(evaluationResult?.facebookUrls) ? evaluationResult.facebookUrls : [];
-    const candidateLinks = Array.isArray(evaluationResult?.candidateLinks) ? evaluationResult.candidateLinks : [];
-    const renderedHtml = evaluationResult?.html || '';
+    const pageEmails = evalResult?.emails || [];
+    const fbRaw = evalResult?.fbRaw || [];
+    const candidateLinks = evalResult?.candidateLinks || [];
 
-    const serverEmails = extractEmails(renderedHtml);
-    const serverFacebookUrls = extractFacebookUrls(renderedHtml);
+    const normalizedFacebook = fbRaw.length > 0 ? extractFacebookUrls(fbRaw.join('\n')) : [];
 
-    const mergedEmails = [...new Set([...pageEmails, ...serverEmails])];
-    const mergedFacebook = [...new Set([...pageFacebookUrls, ...serverFacebookUrls])];
-
-    if (mergedEmails.length > 0) {
-      result.emails.push(...mergedEmails);
-    }
-    if (mergedFacebook.length > 0) {
-      result.facebookUrls.push(...mergedFacebook);
-    }
+    if (pageEmails.length > 0) result.emails.push(...pageEmails);
+    if (normalizedFacebook.length > 0) result.facebookUrls.push(...normalizedFacebook);
 
     if (depth < MAX_DEPTH && result.emails.length === 0 && candidateLinks.length > 0) {
       const linkCollector = createSameDomainLinkCollector(url);
       linkCollector.addCommonPages();
-      for (const link of candidateLinks) {
-        linkCollector.addCandidateLink(link);
-      }
-      const collectedLinks = linkCollector.getLinks();
-      if (collectedLinks.length > 0) {
-        result.newUrls.push(...collectedLinks);
-      }
+      for (const link of candidateLinks) linkCollector.addCandidateLink(link);
+      const collected = linkCollector.getLinks();
+      if (collected.length > 0) result.newUrls.push(...collected);
     }
 
-    console.log(`[Playwright] ${url} → ${mergedEmails.length} emails, ${candidateLinks.length} links`);
-
+    console.log(`[Playwright] ${url} → ${pageEmails.length} emails, ${candidateLinks.length} links`);
   } catch (error) {
-    console.error(`[Playwright Error] Failed to process ${url}:`, error);
-    if (!browser || !browser.isConnected()) {
-      await resetSharedBrowser();
-    }
+    console.error(`[Playwright Error] ${url}: ${error.message}`);
     throw error;
   } finally {
-    if (page) {
-      try { await page.close(); } catch { /* ignore */ }
-    }
-    if (context) {
-      try { await context.close(); } catch { /* ignore */ }
-    }
-    if (semaphoreAcquired) {
-      playwrightContextSemaphore.release();
-    }
+    if (page) try { await page.close(); } catch { /* ignore */ }
   }
 
   return result;
@@ -679,69 +605,88 @@ async function scrapeUrl(url, depth, visitedUrls) {
 
 
 // =========================================================================
-// Direct scraping function
+// Website-level orchestrator -- one context per website, reused for subpages
 // =========================================================================
 async function scrapeWebsite(url) {
   console.log(`Starting scrape for URL: ${url}`);
-  
+
   const uniqueEmails = new Set();
   const uniqueFacebookUrls = new Set();
   const visitedUrls = new Set();
+  let context;
 
+  await playwrightContextSemaphore.acquire();
   try {
-    // Step 1: Scrape the primary URL (depth 0)
-    const primaryResult = await scrapeUrl(url, 0, visitedUrls);
-    primaryResult.emails.forEach(e => uniqueEmails.add(e));
-    primaryResult.facebookUrls.forEach(f => uniqueFacebookUrls.add(f));
+    const browser = await getSharedBrowser();
+    const identity = getNextIdentity();
+    const proxy = getNextProxyUrl();
 
-    // Step 2: Optionally scrape a limited set of same-domain links (only if no emails found)
+    context = await browser.newContext({
+      userAgent: identity.userAgent,
+      locale: identity.locale,
+      viewport: identity.viewport,
+      ...(proxy ? { proxy: { server: proxy } } : {}),
+    });
+
+    await context.setExtraHTTPHeaders({
+      'Accept-Language': identity.acceptLanguage,
+      ...(identity.referer ? { Referer: identity.referer } : {}),
+    });
+
+    await context.route('**/*', async (route) => {
+      try {
+        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(route.request().resourceType())) {
+          await route.abort();
+          return;
+        }
+      } catch { /* ignore */ }
+      await route.continue();
+    });
+
+    const primaryResult = await scrapeUrl(url, 0, visitedUrls, context);
+    primaryResult.emails.forEach((e) => uniqueEmails.add(e));
+    primaryResult.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
+
     if (MAX_DEPTH > 1 && uniqueEmails.size === 0) {
       const baseOrigin = new URL(url).origin;
       const subpageLimit = Math.min(MAX_SUBPAGE_CRAWLS, MAX_LINKS_PER_PAGE);
       const candidateLinks = (primaryResult.newUrls || [])
-        .filter(link => {
-          try {
-            const linkUrl = new URL(link);
-            return linkUrl.origin === baseOrigin && !visitedUrls.has(link);
-          } catch {
-            return false;
-          }
+        .filter((link) => {
+          try { return new URL(link).origin === baseOrigin && !visitedUrls.has(link); }
+          catch { return false; }
         })
         .slice(0, subpageLimit);
 
       await runWithConcurrency(candidateLinks, SUBPAGE_CONCURRENCY, async (link) => {
         try {
-          const subResult = await scrapeUrl(link, 1, visitedUrls);
-          subResult.emails.forEach(e => uniqueEmails.add(e));
-          subResult.facebookUrls.forEach(f => uniqueFacebookUrls.add(f));
-          // Early exit if emails found
-          if (uniqueEmails.size > 0) {
-            return;
-          }
+          const sub = await scrapeUrl(link, 1, visitedUrls, context);
+          sub.emails.forEach((e) => uniqueEmails.add(e));
+          sub.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
         } catch (e) {
-          console.error(`Error during scraping ${link}: ${e && e.message ? e.message : e}`);
-          // Continue with other links even if one fails
+          console.error(`Error scraping ${link}: ${e?.message || e}`);
         }
       });
     }
 
-    // Remove duplicates and prepare results
     const finalEmails = Array.from(uniqueEmails);
     const finalFacebookUrls = Array.from(uniqueFacebookUrls);
-
-    console.log(`Completed scrape: Found ${finalEmails.length} emails and ${finalFacebookUrls.length} Facebook URLs`);
+    console.log(`Completed scrape: ${finalEmails.length} emails, ${finalFacebookUrls.length} Facebook URLs`);
 
     return {
       success: true,
       emails: finalEmails,
       facebook_urls: finalFacebookUrls,
       crawled_urls: Array.from(visitedUrls).slice(0, MAX_STORED_VISITED_URLS),
-      pages_crawled: visitedUrls.size
+      pages_crawled: visitedUrls.size,
     };
-
   } catch (error) {
+    const browser = sharedBrowserInstance;
+    if (browser && !browser.isConnected()) await resetSharedBrowser();
     console.error(`Scrape failed for ${url}:`, error);
     throw error;
+  } finally {
+    if (context) try { await context.close(); } catch { /* ignore */ }
+    playwrightContextSemaphore.release();
   }
 }
 
