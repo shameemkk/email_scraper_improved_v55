@@ -56,20 +56,36 @@ const BLOCKED_DOMAINS = new Set([
   // Social media
   'facebook.com', 'instagram.com', 'linkedin.com', 'twitter.com', 'x.com',
   'youtube.com', 'tiktok.com', 'pinterest.com',
-  // Fonts & assets
+  // Fonts & type foundries
   'fonts.googleapis.com', 'use.typekit.net', 'latofonts.com', 'fontsquirrel.com',
-  'myfonts.com', 'antsoup.com',
+  'myfonts.com', 'antsoup.com', 'latinotype.com', 'fontfabric.com', 'fontspring.com',
+  'typenetwork.com', 'fonts.net', 'monotype.com', 'linotype.com', 'myfonts.net',
+  'typekit.com', 'fontdeck.com', 'webtype.com', 'typography.com', 'paratype.com',
+  'exljbris.com', 'daltonmaag.com', 'marksimonson.com', 'processtypefoundry.com',
+  'hvdfonts.com', 'boldmonday.com', 'typotheque.com', 'typefront.com',
   // Placeholder domains
   'example.com', 'domain.com', 'email.com', 'mysite.com', 'sample.com', 'test.com',
   'yoursite.com', 'companyname.com', 'business.com', 'website.com', 'businessname.com',
-  'company.com', 'info.com', 'domain.co', 'domain.net'
+  'company.com', 'info.com', 'domain.co', 'domain.net', 'yourdomain.com',
+  'yourcompany.com', 'youremail.com', 'sitename.com', 'placeholder.com',
+  'mailinator.com', 'tempmail.com', 'throwaway.email', 'guerrillamail.com', 'mailbox.com',
+  // CMS themes & templates
+  'developer.wordpress.org', 'developer.woocommerce.com', 'developer.joomla.org',
+  'developer.drupal.org', 'developer.magento.com', 'developer.prestashop.com',
+  'developer.opencart.com', 'developer.shopware.com', 'developer.bigcartel.com',
+  'developer.webflow.com', 'developer.squarespace.com', 'developer.ghost.org',
+  'developer.weebly.com', 'developer.wix.com'
 ]);
 
 const BLOCKED_LOCAL_PARTS = new Set([
   'noreply', 'no-reply', 'donotreply', 'do-not-reply',
   'firstname', 'lastname', 'yourname', 'fullname', 'username', 'user.name',
-  'johnsmith', 'john.doe', 'alex.smith', 'user', 'filler', 'placeholder',
-  'your', 'name', 'email'
+  'johnsmith', 'john.doe', 'alex.smith', 'jane.doe', 'user', 'filler', 'placeholder',
+  'your', 'name', 'email', 'test', 'testing', 'demo', 'sample', 'example',
+  'admin', 'webmaster', 'postmaster', 'hostmaster', 'root', 'mailer-daemon',
+  'null', 'devnull', 'abuse', 'no.reply', 'do.not.reply',
+  'your.email', 'your.name', 'first.last', 'yourmail', 'youremail', 'changeme',
+  'someone', 'somebody', 'anyone', 'person', 'customer'
 ]);
 
 const BLOCKED_PATTERNS = [
