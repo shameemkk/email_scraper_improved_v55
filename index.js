@@ -522,8 +522,11 @@ async function runWithConcurrency(items, limit, iteratee) {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Run a promise with a hard timeout – resolves to undefined on timeout instead of hanging. */
-const withTimeout = (promise, ms) =>
-  Promise.race([promise, delay(ms).then(() => undefined)]);
+const withTimeout = (promise, ms) => {
+  let timer;
+  const timeout = new Promise((resolve) => { timer = setTimeout(resolve, ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
 
 class AsyncSemaphore {
   constructor(limit) {
@@ -630,14 +633,29 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       const htmlEmails = fullHtml.match(emailRegex);
       if (htmlEmails) htmlEmails.forEach((e) => emailSet.add(decodeEmail(e)));
 
-      // Emails from data-* attributes commonly used for obfuscation
-      document.querySelectorAll('[data-email], [data-mail], [data-cfemail]').forEach((el) => {
-        for (const attr of ['data-email', 'data-mail', 'data-cfemail']) {
+      // Emails from data-* attributes
+      document.querySelectorAll('[data-email], [data-mail]').forEach((el) => {
+        for (const attr of ['data-email', 'data-mail']) {
           const val = el.getAttribute(attr);
           if (val) {
             const m = val.match(emailRegex);
             if (m) m.forEach((e) => emailSet.add(decodeEmail(e)));
           }
+        }
+      });
+
+      // Decode Cloudflare email protection (data-cfemail stores XOR-encoded hex)
+      document.querySelectorAll('[data-cfemail]').forEach((el) => {
+        const encoded = el.getAttribute('data-cfemail');
+        if (encoded && encoded.length >= 4) {
+          try {
+            const key = parseInt(encoded.substring(0, 2), 16);
+            let decoded = '';
+            for (let i = 2; i < encoded.length; i += 2) {
+              decoded += String.fromCharCode(parseInt(encoded.substring(i, i + 2), 16) ^ key);
+            }
+            if (decoded.includes('@')) emailSet.add(decodeEmail(decoded));
+          } catch {}
         }
       });
 
@@ -686,7 +704,13 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       evalResult = await runPageEvaluate();
     }
 
-    const pageEmails = (evalResult?.emails || []).filter(isValidEmail);
+    // Merge in-browser results with server-side HTML extraction (extractEmails backup)
+    const emailCandidates = new Set(evalResult?.emails || []);
+    const html = await page.content().catch(() => '');
+    if (html) {
+      for (const e of extractEmails(html)) emailCandidates.add(e.toLowerCase().trim());
+    }
+    const pageEmails = Array.from(emailCandidates).filter(isValidEmail);
     const fbRaw = evalResult?.fbRaw || [];
     const candidateLinks = evalResult?.candidateLinks || [];
 
@@ -745,14 +769,18 @@ async function scrapeWebsite(url) {
     });
 
     await context.route('**/*', async (route) => {
-      const req = route.request();
-      if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
-        return route.abort().catch(() => {});
+      try {
+        const req = route.request();
+        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+          return route.abort().catch(() => {});
+        }
+        if (isNonHtmlResource(req.url())) {
+          return route.abort().catch(() => {});
+        }
+        return route.continue().catch(() => {});
+      } catch {
+        try { await route.continue(); } catch { /* route already handled */ }
       }
-      if (isNonHtmlResource(req.url())) {
-        return route.abort().catch(() => {});
-      }
-      return route.continue().catch(() => {});
     });
 
     const primaryResult = await scrapeUrl(url, 0, visitedUrls, context);
@@ -836,8 +864,15 @@ app.post('/extract-emails', async (req, res) => {
       });
     }
 
-    // Scrape directly and return results
-    const result = await scrapeWebsite(url);
+    // Scrape directly and return results (120s overall timeout)
+    const result = await withTimeout(scrapeWebsite(url), 120_000);
+    if (!result) {
+      return res.status(504).json({
+        success: false,
+        error: 'Scrape timed out',
+        message: 'The website took too long to scrape. Try again or use a simpler URL.'
+      });
+    }
     res.json(result);
 
   } catch (error) {
@@ -907,17 +942,20 @@ async function startServer() {
 // =========================================================================
 
 if (cluster.isPrimary) {
+  let shuttingDown = false;
+
   // Master process - spawn workers
   console.log(`[Master ${process.pid}] Starting ${NUM_WORKERS} workers...`);
-  
+
   // Spawn workers
   for (let i = 0; i < NUM_WORKERS; i++) {
     const worker = cluster.fork();
     console.log(`[Master] Spawned worker ${worker.process.pid}`);
   }
-  
-  // Handle worker exit - restart if crashed
+
+  // Handle worker exit - restart if crashed (but not during shutdown)
   cluster.on('exit', (worker, code, signal) => {
+    if (shuttingDown) return;
     console.log(`[Master] Worker ${worker.process.pid} died (code: ${code}, signal: ${signal}). Restarting...`);
     const newWorker = cluster.fork();
     console.log(`[Master] Spawned new worker ${newWorker.process.pid}`);
@@ -930,6 +968,8 @@ if (cluster.isPrimary) {
   
   // Graceful shutdown for master
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log('[Master] Shutting down gracefully...');
     console.log('[Master] Closing all workers...');
 
