@@ -13,12 +13,12 @@ const app = express();
 
 // Configuration
 const MAX_DEPTH = Math.max(1, parseInt(process.env.MAX_DEPTH, 10) || 2);
-const parsedSubpageConcurrency = parseInt(process.env.SUBPAGE_CONCURRENCY, 6);
+const parsedSubpageConcurrency = parseInt(process.env.SUBPAGE_CONCURRENCY, 10);
 const SUBPAGE_CONCURRENCY = Math.max(
   1,
   Number.isFinite(parsedSubpageConcurrency) ? parsedSubpageConcurrency : 10
 ); // Max secondary links in parallel
-const parsedPlaywrightContexts = parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 6);
+const parsedPlaywrightContexts = parseInt(process.env.PLAYWRIGHT_MAX_CONTEXTS, 10);
 const PLAYWRIGHT_MAX_CONTEXTS = Math.max(
   1,
   Number.isFinite(parsedPlaywrightContexts) ? parsedPlaywrightContexts : 10
@@ -35,8 +35,7 @@ const PAGE_NAVIGATION_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PAGE_NAVI
 const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISITED_URLS, 10) || 200);
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
 const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
-  'image', 'media', 'font', 'stylesheet', 'texttrack',
-  'eventsource', 'websocket', 'manifest', 'ping',
+  'image', 'media', 'font',
 ]);
 
 const USER_AGENTS = [
@@ -210,6 +209,40 @@ function extractEmails(html) {
   emails.push(...textEmails);
   
   return [...new Set(emails)]; // Remove duplicates
+}
+
+// Email validation – filters false positives from regex matches
+const INVALID_EMAIL_TLDS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'bmp',
+  'css', 'js', 'map', 'json', 'xml', 'woff', 'woff2', 'ttf', 'eot',
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'pdf', 'zip', 'gz',
+]);
+
+function isValidEmail(email) {
+  if (!email || typeof email !== 'string') return false;
+  const e = email.toLowerCase().trim();
+  if (e.length < 6 || e.length > 254) return false;
+
+  const atIdx = e.indexOf('@');
+  if (atIdx < 1 || atIdx !== e.lastIndexOf('@')) return false;
+
+  const local = e.slice(0, atIdx);
+  const domain = e.slice(atIdx + 1);
+  if (!local || local.length > 64 || !domain) return false;
+  if (!domain.includes('.')) return false;
+
+  const tld = domain.split('.').pop();
+  if (!tld || tld.length < 2) return false;
+  if (INVALID_EMAIL_TLDS.has(tld)) return false;
+
+  // reject leading/trailing dots or hyphens, consecutive dots
+  if (/^[.\-_+]|[.\-_+]$/.test(local)) return false;
+  if (/\.{2,}/.test(local) || /\.{2,}/.test(domain)) return false;
+
+  if (!/^[a-z0-9._%+\-]+$/.test(local)) return false;
+  if (!/^[a-z0-9.\-]+\.[a-z]{2,}$/.test(domain)) return false;
+
+  return true;
 }
 
 // Facebook URL extraction function - improved to handle escaped/encoded links (including script blocks)
@@ -488,6 +521,10 @@ async function runWithConcurrency(items, limit, iteratee) {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Run a promise with a hard timeout – resolves to undefined on timeout instead of hanging. */
+const withTimeout = (promise, ms) =>
+  Promise.race([promise, delay(ms).then(() => undefined)]);
+
 class AsyncSemaphore {
   constructor(limit) {
     this.limit = Math.max(1, Number.isFinite(limit) ? limit : 1);
@@ -545,13 +582,8 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     page = await context.newPage();
     // Cancel any downloads (e.g. when server sends Content-Disposition: attachment)
     page.on('download', (download) => download.cancel().catch(() => {}));
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_NAVIGATION_TIMEOUT_MS });
-    // Wait for the network to go quiet so JS-rendered content (including emails) has time to appear
+    await page.goto(url, { waitUntil: 'load', timeout: PAGE_NAVIGATION_TIMEOUT_MS });
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForFunction(
-      () => (document.body?.innerText?.length || 0) > 200,
-      { timeout: 10000 }
-    ).catch(() => {});
 
     const runPageEvaluate = () => page.evaluate((candidateLimit) => {
       const toAbsolute = (href) => {
@@ -586,15 +618,52 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
         if (lower.includes('facebook.com') || lower.includes('fb.com/')) fbRaw.push(abs);
       });
 
+      // Emails from visible body text
       const bodyText = document.body ? document.body.innerText || '' : '';
       if (bodyText) {
         const found = bodyText.match(emailRegex);
         if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
+      }
 
+      // Emails from full HTML (hidden elements, attributes, comments)
+      const fullHtml = document.documentElement.innerHTML || '';
+      const htmlEmails = fullHtml.match(emailRegex);
+      if (htmlEmails) htmlEmails.forEach((e) => emailSet.add(decodeEmail(e)));
+
+      // Emails from data-* attributes commonly used for obfuscation
+      document.querySelectorAll('[data-email], [data-mail], [data-cfemail]').forEach((el) => {
+        for (const attr of ['data-email', 'data-mail', 'data-cfemail']) {
+          const val = el.getAttribute(attr);
+          if (val) {
+            const m = val.match(emailRegex);
+            if (m) m.forEach((e) => emailSet.add(decodeEmail(e)));
+          }
+        }
+      });
+
+      // Emails from meta tags
+      document.querySelectorAll('meta[content]').forEach((meta) => {
+        const content = meta.getAttribute('content') || '';
+        const found = content.match(emailRegex);
+        if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
+      });
+
+      // Emails from structured data (JSON-LD)
+      document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+        try {
+          const text = s.textContent || '';
+          const found = text.match(emailRegex);
+          if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
+        } catch {}
+      });
+
+      // Facebook URLs from body text
+      if (bodyText) {
         const fbText = bodyText.match(/https?:\/\/(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>]+/gi);
         if (fbText) fbRaw.push(...fbText);
       }
 
+      // Facebook URLs from script blocks
       document.querySelectorAll('script').forEach((s) => {
         const c = s.textContent;
         if (!c || !/facebook\.com|fb\.com/i.test(c)) return;
@@ -611,14 +680,13 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
 
     let evalResult = await runPageEvaluate();
 
-    // If no emails found, the page might still be JS-rendering — wait and retry once
-    if ((!evalResult?.emails || evalResult.emails.length === 0)) {
-      await delay(3000);
-      await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    // If no emails found, the page might still be JS-rendering — short retry once
+    if (!evalResult?.emails?.length) {
+      await delay(1500);
       evalResult = await runPageEvaluate();
     }
 
-    const pageEmails = evalResult?.emails || [];
+    const pageEmails = (evalResult?.emails || []).filter(isValidEmail);
     const fbRaw = evalResult?.fbRaw || [];
     const candidateLinks = evalResult?.candidateLinks || [];
 
@@ -640,7 +708,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     console.error(`[Playwright Error] ${url}: ${error.message}`);
     throw error;
   } finally {
-    if (page) try { await page.close(); } catch { /* ignore */ }
+    if (page) try { await withTimeout(page.close(), 5000); } catch { /* ignore */ }
   }
 
   return result;
@@ -677,40 +745,14 @@ async function scrapeWebsite(url) {
     });
 
     await context.route('**/*', async (route) => {
-      try {
-        const req = route.request();
-        if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
-          await route.abort();
-          return;
-        }
-        // Block URLs that trigger downloads (PDF, images, documents, etc.)
-        if (isNonHtmlResource(req.url())) {
-          await route.abort();
-          return;
-        }
-        // For document requests: strip Content-Disposition: attachment so the page renders instead of downloading
-        if (req.resourceType() === 'document') {
-          try {
-            const response = await route.fetch();
-            const rawHeaders = response.headers();
-            const cd = rawHeaders['content-disposition'] || rawHeaders['Content-Disposition'] || '';
-            if (cd.toLowerCase().startsWith('attachment')) {
-              const headers = {};
-              for (const [k, v] of Object.entries(rawHeaders)) {
-                if (k.toLowerCase() !== 'content-disposition') headers[k] = v;
-              }
-              headers['content-disposition'] = 'inline';
-              await route.fulfill({
-                status: response.status(),
-                headers,
-                body: await response.body(),
-              });
-              return;
-            }
-          } catch { /* fall through to continue */ }
-        }
-      } catch { /* ignore */ }
-      await route.continue();
+      const req = route.request();
+      if (PLAYWRIGHT_BLOCKED_RESOURCE_TYPES.has(req.resourceType())) {
+        return route.abort().catch(() => {});
+      }
+      if (isNonHtmlResource(req.url())) {
+        return route.abort().catch(() => {});
+      }
+      return route.continue().catch(() => {});
     });
 
     const primaryResult = await scrapeUrl(url, 0, visitedUrls, context);
@@ -755,7 +797,7 @@ async function scrapeWebsite(url) {
     // console.error(`Scrape failed for ${url}:`, error);
     throw error;
   } finally {
-    if (context) try { await context.close(); } catch { /* ignore */ }
+    if (context) try { await withTimeout(context.close(), 10000); } catch { /* ignore */ }
     playwrightContextSemaphore.release();
   }
 }
@@ -890,7 +932,7 @@ if (cluster.isPrimary) {
   const shutdown = async () => {
     console.log('[Master] Shutting down gracefully...');
     console.log('[Master] Closing all workers...');
-    
+
     // Disconnect all workers
     for (const id in cluster.workers) {
       const worker = cluster.workers[id];
@@ -898,11 +940,20 @@ if (cluster.isPrimary) {
         worker.disconnect();
       }
     }
-    
-    // Wait a bit for workers to finish
+
+    // After 5s, kill any workers still alive, then exit
     setTimeout(() => {
-      console.log('[Master] Force exiting...');
-      process.exit(0);
+      for (const id in cluster.workers) {
+        const worker = cluster.workers[id];
+        if (worker && !worker.isDead()) {
+          console.log(`[Master] Force killing worker ${worker.process.pid}`);
+          worker.process.kill('SIGKILL');
+        }
+      }
+      setTimeout(() => {
+        console.log('[Master] Force exiting...');
+        process.exit(0);
+      }, 1000);
     }, 5000);
   };
   
@@ -916,7 +967,7 @@ if (cluster.isPrimary) {
   // Graceful shutdown for workers
   const shutdown = async () => {
     console.log(`[Worker ${process.pid}] Shutting down gracefully...`);
-    await closeSharedBrowser();
+    await withTimeout(closeSharedBrowser(), 8000);
     process.exit(0);
   };
   
@@ -926,7 +977,7 @@ if (cluster.isPrimary) {
   // Handle disconnect from master
   process.on('disconnect', async () => {
     console.log(`[Worker ${process.pid}] Disconnected from master, closing browser...`);
-    await closeSharedBrowser();
+    await withTimeout(closeSharedBrowser(), 8000);
     process.exit(0);
   });
 }

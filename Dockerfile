@@ -11,7 +11,7 @@ WORKDIR /app
 
 COPY package*.json ./
 
-ENV NODE_OPTIONS="--max-old-space-size=2048"
+ENV NODE_OPTIONS="--max-old-space-size=2048" 
 
 RUN npm install --omit=dev && \
     npx playwright install-deps && \
