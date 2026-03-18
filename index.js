@@ -882,7 +882,7 @@ async function scrapeWebsite(url) {
     }
 
     // Only crawl subpages if no emails found on primary page
-    if (MAX_DEPTH > 1 && !earlyExitSignal.found && primaryResult.emails.length === 0) {
+    if (MAX_DEPTH > 1 && !earlyExitSignal.found) {
       const baseOrigin = new URL(url).origin;
       const subpageLimit = Math.min(MAX_SUBPAGE_CRAWLS, MAX_LINKS_PER_PAGE);
       const candidateLinks = (primaryResult.newUrls || [])
