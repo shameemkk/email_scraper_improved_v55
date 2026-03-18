@@ -34,6 +34,7 @@ const MAX_LINKS_PER_PAGE = Math.max(1, parseInt(process.env.MAX_LINKS_PER_PAGE, 
 const PAGE_NAVIGATION_TIMEOUT_MS = Math.max(5000, parseInt(process.env.PAGE_NAVIGATION_TIMEOUT_MS, 10) || 60000);
 const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISITED_URLS, 10) || 200);
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
+const OVERALL_TIMEOUT_MS = Math.max(10000, parseInt(process.env.OVERALL_TIMEOUT_MS, 10) || 120000);
 const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
   'image', 'media', 'font',
 ]);
@@ -865,7 +866,7 @@ app.post('/extract-emails', async (req, res) => {
     }
 
     // Scrape directly and return results (120s overall timeout)
-    const result = await withTimeout(scrapeWebsite(url), 120_000);
+    const result = await withTimeout(scrapeWebsite(url), OVERALL_TIMEOUT_MS);
     if (!result) {
       return res.status(504).json({
         success: false,
