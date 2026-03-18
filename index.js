@@ -39,6 +39,93 @@ const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
   'image', 'media', 'font',
 ]);
 
+// =========================================================================
+// EMAIL FILTERING – eliminates junk/placeholder emails from results
+// =========================================================================
+
+const BLOCKED_DOMAINS = new Set([
+  // Error tracking & monitoring
+  'sentry.io', 'sentry.wixpress.com', 'sentry-next.wixpress.com', 'ingest.sentry.io',
+  'newrelic.com', 'rollbar.com', 'datadoghq.com', 'bugsnag.com',
+  // Platforms & hosting
+  'wordpress.com', 'wordpress.org', 'wpengine.com', 'wix.com', 'squarespace.com',
+  'shopify.com', 'shopifyemail.com', 'bigcommerce.com', 'weebly.com', 'webflow.io',
+  'ghost.org', 'godaddy.com', 'cloudflare.com', 'cloudfront.net', 'amazonaws.com',
+  'azure.com', 'digitalocean.com', 'linode.com', 'heroku.com', 'netlify.app',
+  'vercel.app', 'render.com', 'cloudwaysapps.com',
+  // Social media
+  'facebook.com', 'instagram.com', 'linkedin.com', 'twitter.com', 'x.com',
+  'youtube.com', 'tiktok.com', 'pinterest.com',
+  // Fonts & assets
+  'fonts.googleapis.com', 'use.typekit.net', 'latofonts.com', 'fontsquirrel.com',
+  'myfonts.com', 'antsoup.com',
+  // Placeholder domains
+  'example.com', 'domain.com', 'email.com', 'mysite.com', 'sample.com', 'test.com',
+  'yoursite.com', 'companyname.com', 'business.com', 'website.com', 'businessname.com',
+  'company.com', 'info.com', 'domain.co', 'domain.net'
+]);
+
+const BLOCKED_LOCAL_PARTS = new Set([
+  'noreply', 'no-reply', 'donotreply', 'do-not-reply',
+  'firstname', 'lastname', 'yourname', 'fullname', 'username', 'user.name',
+  'johnsmith', 'john.doe', 'alex.smith', 'user', 'filler', 'placeholder',
+  'your', 'name', 'email'
+]);
+
+const BLOCKED_PATTERNS = [
+  /^[%\s?&]/,
+  /^@/,
+  /@.*@/,
+  /\.(css|js|json|xml|map|min\.js|min\.css|woff|woff2|ttf|eot|pdf)$/i,
+  /\.(png|jpg|jpeg|gif|svg|webp|ico)$/i,
+  /@\d+x\.(png|jpg|jpeg|gif|svg|webp)$/i,
+  /^(sprite|icon|logo|banner|image|font)/i,
+  /%[0-9A-Fa-f]{2}/,
+  /\?/,
+  /subject=/i,
+  /body=/i,
+  /&/,
+  /@o\d+\.ingest\.sentry\.io/i,
+  /wixpress\.com$/i,
+  /sentry/i,
+  /shoplocal/i,
+  /news\.cfm/i,
+];
+
+function isJunkEmail(email) {
+  if (!email || typeof email !== 'string') return true;
+  const normalized = email.toLowerCase().trim();
+
+  for (const pattern of BLOCKED_PATTERNS) {
+    if (pattern.test(normalized)) return true;
+  }
+
+  const atIndex = normalized.lastIndexOf('@');
+  if (atIndex === -1 || atIndex === 0 || atIndex === normalized.length - 1) return true;
+
+  const localPart = normalized.substring(0, atIndex);
+  const domain = normalized.substring(atIndex + 1);
+
+  if (BLOCKED_LOCAL_PARTS.has(localPart)) return true;
+
+  if (BLOCKED_DOMAINS.has(domain)) return true;
+  for (const blocked of BLOCKED_DOMAINS) {
+    if (domain.endsWith(`.${blocked}`)) return true;
+  }
+
+  if (localPart.length < 2 || domain.length < 4) return true;
+  if (!domain.includes('.')) return true;
+  if (/^(sprite|icon|logo|banner|image|font|@\d+x)/i.test(localPart)) return true;
+
+  return false;
+}
+
+function filterEmails(emails) {
+  return emails.filter(email => isValidEmail(email) && !isJunkEmail(email));
+}
+
+const EARLY_EXIT_EMAIL_THRESHOLD = 10;
+
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
@@ -711,7 +798,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     if (html) {
       for (const e of extractEmails(html)) emailCandidates.add(e.toLowerCase().trim());
     }
-    const pageEmails = Array.from(emailCandidates).filter(isValidEmail);
+    const pageEmails = filterEmails(Array.from(emailCandidates));
     const fbRaw = evalResult?.fbRaw || [];
     const candidateLinks = evalResult?.candidateLinks || [];
 
@@ -749,6 +836,7 @@ async function scrapeWebsite(url) {
   const uniqueEmails = new Set();
   const uniqueFacebookUrls = new Set();
   const visitedUrls = new Set();
+  const earlyExitSignal = { found: false };
   let context;
 
   await playwrightContextSemaphore.acquire();
@@ -788,7 +876,13 @@ async function scrapeWebsite(url) {
     primaryResult.emails.forEach((e) => uniqueEmails.add(e));
     primaryResult.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
 
-    if (MAX_DEPTH > 1) {
+    // Early exit: skip subpages if we already have enough emails
+    if (uniqueEmails.size >= EARLY_EXIT_EMAIL_THRESHOLD) {
+      earlyExitSignal.found = true;
+    }
+
+    // Only crawl subpages if no emails found on primary page
+    if (MAX_DEPTH > 1 && !earlyExitSignal.found && primaryResult.emails.length === 0) {
       const baseOrigin = new URL(url).origin;
       const subpageLimit = Math.min(MAX_SUBPAGE_CRAWLS, MAX_LINKS_PER_PAGE);
       const candidateLinks = (primaryResult.newUrls || [])
@@ -799,10 +893,14 @@ async function scrapeWebsite(url) {
         .slice(0, subpageLimit);
 
       await runWithConcurrency(candidateLinks, SUBPAGE_CONCURRENCY, async (link) => {
+        if (earlyExitSignal.found) return;
         try {
           const sub = await scrapeUrl(link, 1, visitedUrls, context);
           sub.emails.forEach((e) => uniqueEmails.add(e));
           sub.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
+          if (uniqueEmails.size >= EARLY_EXIT_EMAIL_THRESHOLD) {
+            earlyExitSignal.found = true;
+          }
         } catch (e) {
           console.error(`Error scraping ${link}: ${e?.message || e}`);
         }
