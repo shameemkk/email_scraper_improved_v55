@@ -786,9 +786,9 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
 
     let evalResult = await runPageEvaluate();
 
-    // If no emails found, the page might still be JS-rendering — short retry once
-    if (!evalResult?.emails?.length) {
-      await delay(1500);
+    // If no emails and no links found, the page might still be JS-rendering — retry once
+    if (!evalResult?.emails?.length && !evalResult?.candidateLinks?.length) {
+      await delay(2000);
       evalResult = await runPageEvaluate();
     }
 
@@ -807,7 +807,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     if (pageEmails.length > 0) result.emails.push(...pageEmails);
     if (normalizedFacebook.length > 0) result.facebookUrls.push(...normalizedFacebook);
 
-    if (depth < MAX_DEPTH && candidateLinks.length > 0) {
+    if (depth < MAX_DEPTH) {
       const linkCollector = createSameDomainLinkCollector(url);
       linkCollector.addCommonPages();
       for (const link of candidateLinks) linkCollector.addCandidateLink(link);
