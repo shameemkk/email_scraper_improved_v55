@@ -848,7 +848,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
 // =========================================================================
 // Website-level orchestrator -- one context per website, reused for subpages
 // =========================================================================
-async function scrapeWebsite(url) {
+async function scrapeWebsite(url, { signal } = {}) {
   console.log(`Starting scrape for URL: ${url}`);
 
   const uniqueEmails = new Set();
@@ -856,9 +856,15 @@ async function scrapeWebsite(url) {
   const visitedUrls = new Set();
   const earlyExitSignal = { found: false };
   let context;
+  let onAbort;
+
+  /** Check if the overall timeout has been reached. */
+  const isAborted = () => signal && signal.aborted;
 
   await playwrightContextSemaphore.acquire();
   try {
+    if (isAborted()) return null;
+
     const browser = await getSharedBrowser();
     const identity = getNextIdentity();
     const proxy = getNextProxyUrl();
@@ -869,6 +875,16 @@ async function scrapeWebsite(url) {
       viewport: identity.viewport,
       ...(proxy ? { proxy: { server: proxy } } : {}),
     });
+
+    // When the timeout fires, close the context immediately so all in-flight
+    // pages are torn down and the scrape stops doing real work.
+    onAbort = () => {
+      if (context) {
+        console.log(`Timeout reached – force-closing browser context for ${url}`);
+        context.close().catch(() => {});
+      }
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
 
     await context.setExtraHTTPHeaders({
       'Accept-Language': identity.acceptLanguage,
@@ -897,7 +913,12 @@ async function scrapeWebsite(url) {
       }
     });
 
+    if (isAborted()) return null;
+
     const primaryResult = await scrapeUrl(url, 0, visitedUrls, context);
+
+    if (isAborted()) return null;
+
     primaryResult.emails.forEach((e) => uniqueEmails.add(e));
     primaryResult.facebookUrls.forEach((f) => uniqueFacebookUrls.add(f));
 
@@ -918,7 +939,7 @@ async function scrapeWebsite(url) {
         .slice(0, subpageLimit);
 
       await runWithConcurrency(candidateLinks, SUBPAGE_CONCURRENCY, async (link) => {
-        if (earlyExitSignal.found) return;
+        if (earlyExitSignal.found || isAborted()) return;
         try {
           const sub = await scrapeUrl(link, 1, visitedUrls, context);
           sub.emails.forEach((e) => uniqueEmails.add(e));
@@ -927,10 +948,13 @@ async function scrapeWebsite(url) {
             earlyExitSignal.found = true;
           }
         } catch (e) {
+          if (isAborted()) return;
           console.error(`Error scraping ${link}: ${e?.message || e}`);
         }
       });
     }
+
+    if (isAborted()) return null;
 
     const finalEmails = Array.from(uniqueEmails);
     const finalFacebookUrls = Array.from(uniqueFacebookUrls);
@@ -944,11 +968,13 @@ async function scrapeWebsite(url) {
       pages_crawled: visitedUrls.size,
     };
   } catch (error) {
+    // If aborted, this is expected – not a real error
+    if (isAborted()) return null;
     const browser = sharedBrowserInstance;
     if (browser && !browser.isConnected()) await resetSharedBrowser();
-    // console.error(`Scrape failed for ${url}:`, error);
     throw error;
   } finally {
+    if (signal) signal.removeEventListener('abort', onAbort);
     if (context) try { await withTimeout(context.close(), 10000); } catch { /* ignore */ }
     playwrightContextSemaphore.release();
   }
@@ -988,16 +1014,26 @@ app.post('/extract-emails', async (req, res) => {
       });
     }
 
-    // Scrape directly and return results (120s overall timeout)
-    const result = await withTimeout(scrapeWebsite(url), OVERALL_TIMEOUT_MS);
-    if (!result) {
-      return res.status(504).json({
-        success: false,
-        error: 'Scrape timed out',
-        message: 'The website took too long to scrape. Try again or use a simpler URL.'
-      });
+    // Scrape directly and return results (120s overall timeout).
+    // AbortController ensures the browser context is torn down on timeout
+    // instead of letting the scrape continue in the background.
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), OVERALL_TIMEOUT_MS);
+    try {
+      const result = await scrapeWebsite(url, { signal: ac.signal });
+      clearTimeout(timer);
+      if (!result) {
+        return res.status(504).json({
+          success: false,
+          error: 'Scrape timed out',
+          message: 'The website took too long to scrape. Try again or use a simpler URL.'
+        });
+      }
+      res.json(result);
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
     }
-    res.json(result);
 
   } catch (error) {
     console.error('Error scraping:', error);
