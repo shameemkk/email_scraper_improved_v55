@@ -36,8 +36,43 @@ const MAX_STORED_VISITED_URLS = Math.max(1, parseInt(process.env.MAX_STORED_VISI
 const MAX_SUBPAGE_CRAWLS = Math.max(1, parseInt(process.env.MAX_SUBPAGE_CRAWLS, 10) || 20);
 const OVERALL_TIMEOUT_MS = Math.max(10000, parseInt(process.env.OVERALL_TIMEOUT_MS, 10) || 120000);
 const PLAYWRIGHT_BLOCKED_RESOURCE_TYPES = new Set([
-  'image', 'media', 'font',
+  'image', 'media', 'font', 'stylesheet',
 ]);
+
+// Tracking & analytics domains to block — skips GA, GTM, Facebook pixel, Hotjar, etc.
+const BLOCKED_TRACKING_DOMAINS = [
+  'google-analytics.com',
+  'googletagmanager.com',
+  'analytics.google.com',
+  'www.googletagmanager.com',
+  'connect.facebook.net',
+  'www.facebook.com/tr',
+  'pixel.facebook.com',
+  'snap.licdn.com',
+  'bat.bing.com',
+  'hotjar.com',
+  'static.hotjar.com',
+  'script.hotjar.com',
+  'vars.hotjar.com',
+  'fullstory.com',
+  'rs.fullstory.com',
+  'cdn.segment.com',
+  'api.segment.io',
+  'cdn.mxpnl.com',
+  'api-js.mixpanel.com',
+  'heapanalytics.com',
+  'cdn.heapanalytics.com',
+  'plausible.io',
+  'cdn.amplitude.com',
+  'api.amplitude.com',
+  'js.intercomcdn.com',
+  'widget.intercom.io',
+  'static.doubleclick.net',
+  'ad.doubleclick.net',
+  'pagead2.googlesyndication.com',
+  'www.clarity.ms',
+  'clarity.ms',
+];
 
 // =========================================================================
 // EMAIL FILTERING – eliminates junk/placeholder emails from results
@@ -287,33 +322,6 @@ app.use(express.json());
 // =========================================================================
 // EMAIL & URL EXTRACTION FUNCTIONS (Kept as is - DO NOT CHANGE)
 // =========================================================================
-
-// Email extraction function - works with HTML content
-function extractEmails(html) {
-  const emails = [];
-  
-  // Extract emails from mailto: href attributes
-  const mailtoRegex = /href=["']mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})["']/gi;
-  const mailtoMatches = html.matchAll(mailtoRegex);
-  for (const match of mailtoMatches) {
-    emails.push(match[1]);
-  }
-  
-  // Extract emails wrapped in HTML tags (like font, b, span, etc.)
-  const htmlEmailRegex = /<[^>]*>([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})<\/[^>]*>/gi;
-  const htmlEmailMatches = html.matchAll(htmlEmailRegex);
-  for (const match of htmlEmailMatches) {
-    emails.push(match[1]);
-  }
-  
-  // Extract emails from plain text (after removing HTML tags)
-  const textContent = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-  const textEmails = textContent.match(emailRegex) || [];
-  emails.push(...textEmails);
-  
-  return [...new Set(emails)]; // Remove duplicates
-}
 
 // Email validation – filters false positives from regex matches
 const INVALID_EMAIL_TLDS = new Set([
@@ -689,8 +697,8 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
     page = await context.newPage();
     // Cancel any downloads (e.g. when server sends Content-Disposition: attachment)
     page.on('download', (download) => download.cancel().catch(() => {}));
-    await page.goto(url, { waitUntil: 'load', timeout: PAGE_NAVIGATION_TIMEOUT_MS });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: PAGE_NAVIGATION_TIMEOUT_MS });
+    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
     const runPageEvaluate = () => page.evaluate((candidateLimit) => {
       const toAbsolute = (href) => {
@@ -808,13 +816,7 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
       evalResult = await runPageEvaluate();
     }
 
-    // Merge in-browser results with server-side HTML extraction (extractEmails backup)
-    const emailCandidates = new Set(evalResult?.emails || []);
-    const html = await page.content().catch(() => '');
-    if (html) {
-      for (const e of extractEmails(html)) emailCandidates.add(e.toLowerCase().trim());
-    }
-    const pageEmails = filterEmails(Array.from(emailCandidates));
+    const pageEmails = filterEmails(evalResult?.emails || []);
     const fbRaw = evalResult?.fbRaw || [];
     const candidateLinks = evalResult?.candidateLinks || [];
 
@@ -882,6 +884,13 @@ async function scrapeWebsite(url) {
         if (isNonHtmlResource(req.url())) {
           return route.abort().catch(() => {});
         }
+        // Block tracking & analytics requests
+        try {
+          const hostname = new URL(req.url()).hostname;
+          if (BLOCKED_TRACKING_DOMAINS.some(d => hostname === d || hostname.endsWith(`.${d}`))) {
+            return route.abort().catch(() => {});
+          }
+        } catch {}
         return route.continue().catch(() => {});
       } catch {
         try { await route.continue(); } catch { /* route already handled */ }
