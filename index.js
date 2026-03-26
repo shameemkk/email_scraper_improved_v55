@@ -72,6 +72,22 @@ const BLOCKED_TRACKING_DOMAINS = [
   'pagead2.googlesyndication.com',
   'www.clarity.ms',
   'clarity.ms',
+  // Maps & heavy embeds — not needed for email extraction
+  'maps.googleapis.com',
+  'maps.gstatic.com',
+  'maps.google.com',
+  'www.google.com/maps',
+  'tiles.mapbox.com',
+  'api.mapbox.com',
+  'cdn.jsdelivr.net',
+  'cdnjs.cloudflare.com',
+  'unpkg.com',
+  // Chat widgets
+  'widget.trustpilot.com',
+  'js.driftt.com',
+  'embed.tawk.to',
+  'static.zdassets.com',
+  'ekr.zdassets.com',
 ];
 
 // =========================================================================
@@ -547,6 +563,37 @@ function isNonHtmlResource(url) {
   }
 }
 
+/**
+ * Detects whether a link is a "sibling" page of the current URL — e.g. another
+ * store location, product, or listing at the same path depth. These rarely
+ * contain unique contact emails and just slow down the crawl.
+ */
+function isSiblingPage(baseUrl, candidateUrl) {
+  const baseParts = baseUrl.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+  const candParts = candidateUrl.pathname.replace(/\/+$/, '').split('/').filter(Boolean);
+
+  // Only apply heuristic when base URL has 3+ path segments (e.g. /ga/rincon/410-s-columbia)
+  if (baseParts.length < 3) return false;
+
+  // Same depth as the base URL → likely a cousin/sibling listing page
+  // (e.g. /ga/pooler/202-main vs /ga/rincon/410-columbia — different city, same structure)
+  if (candParts.length === baseParts.length && candParts.join('/') !== baseParts.join('/')) {
+    return true;
+  }
+
+  // Candidate is a parent listing page (e.g. /ga/rincon or /ga when base is /ga/rincon/410-s-columbia)
+  // These are index pages with hundreds of links, not contact pages
+  if (
+    candParts.length >= 1 &&
+    candParts.length < baseParts.length &&
+    baseParts.slice(0, candParts.length).join('/') === candParts.join('/')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 function createSameDomainLinkCollector(baseUrlHref) {
   const baseUrl = new URL(baseUrlHref);
   const normalizedCurrentUrl = cleanUrl(baseUrl.href);
@@ -564,6 +611,10 @@ function createSameDomainLinkCollector(baseUrlHref) {
     try {
       const linkUrl = new URL(candidate, baseUrl.href);
       if (linkUrl.origin !== baseUrl.origin) {
+        return;
+      }
+      // Skip sibling pages (other store locations, product pages, etc.)
+      if (isSiblingPage(baseUrl, linkUrl)) {
         return;
       }
       const finalUrl = cleanUrl(linkUrl.href);
@@ -740,10 +791,27 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
         if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
       }
 
-      // Emails from full HTML (hidden elements, attributes, comments)
-      const fullHtml = document.documentElement.innerHTML || '';
-      const htmlEmails = fullHtml.match(emailRegex);
-      if (htmlEmails) htmlEmails.forEach((e) => emailSet.add(decodeEmail(e)));
+      // Emails from hidden text nodes (walk the DOM instead of scanning raw innerHTML,
+      // which can be multi-MB and extremely slow to regex-match)
+      const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const text = walker.currentNode.nodeValue;
+        if (text && text.includes('@')) {
+          const found = text.match(emailRegex);
+          if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
+        }
+      }
+
+      // Emails from common attributes that may contain emails
+      document.querySelectorAll('[href], [content], [value], [title], [alt]').forEach((el) => {
+        for (const attr of ['href', 'content', 'value', 'title', 'alt']) {
+          const val = el.getAttribute(attr);
+          if (val && val.includes('@')) {
+            const found = val.match(emailRegex);
+            if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
+          }
+        }
+      });
 
       // Emails from data-* attributes
       document.querySelectorAll('[data-email], [data-mail]').forEach((el) => {
@@ -769,13 +837,6 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
             if (decoded.includes('@')) emailSet.add(decodeEmail(decoded));
           } catch {}
         }
-      });
-
-      // Emails from meta tags
-      document.querySelectorAll('meta[content]').forEach((meta) => {
-        const content = meta.getAttribute('content') || '';
-        const found = content.match(emailRegex);
-        if (found) found.forEach((e) => emailSet.add(decodeEmail(e)));
       });
 
       // Emails from structured data (JSON-LD)
