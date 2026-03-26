@@ -388,17 +388,26 @@ function extractFacebookUrls(text) {
     /https?%3A%2F%2F(?:www\.)?(?:facebook\.com|fb\.com)[^"'<>\\)]+/gi
   ];
 
+  // Truncate at URL-encoded delimiters and embedded protocol starts
+  const truncateEncoded = (u) => {
+    let clean = u.split(/%22|%27|%2C/i)[0];
+    // If another "http" appears mid-URL, truncate there (concatenated URLs in scripts)
+    const secondHttp = clean.indexOf('http', 10);
+    if (secondHttp > 0) clean = clean.slice(0, secondHttp);
+    return clean;
+  };
+
   patterns.forEach(pattern => {
     let match;
     while ((match = pattern.exec(text)) !== null) {
-      candidates.add(match[0]);
+      candidates.add(truncateEncoded(match[0]));
     }
   });
 
   const barePattern = /(?:facebook\.com|fb\.com)\/[^\s"'<>\\)]+/gi;
   let bareMatch;
   while ((bareMatch = barePattern.exec(text)) !== null) {
-    candidates.add(`https://${bareMatch[0]}`);
+    candidates.add(truncateEncoded(`https://${bareMatch[0]}`));
   }
 
   const results = new Set();
@@ -859,7 +868,13 @@ async function scrapeUrl(url, depth, visitedUrls, context) {
         const c = s.textContent;
         if (!c || !/facebook\.com|fb\.com/i.test(c)) return;
         const m = c.match(/https?(?:[:\\/]{1,5}|%3A%2F%2F)(?:www\.)?(?:facebook\.com|fb\.com)[^\s"'<>\\)]{1,500}/gi);
-        if (m) fbRaw.push(...m);
+        // Truncate at URL-encoded delimiters and embedded protocol starts
+        if (m) fbRaw.push(...m.map(u => {
+          let clean = u.split(/%22|%27|%2C/i)[0];
+          const secondHttp = clean.indexOf('http', 10);
+          if (secondHttp > 0) clean = clean.slice(0, secondHttp);
+          return clean;
+        }));
       });
 
       return {
